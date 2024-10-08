@@ -4,17 +4,17 @@
 #include <round.h>
 #include <stdint.h>
 #include "lib/kernel/list.h"
+
 /* Number of timer interrupts per second. */
 #define TIMER_FREQ 100
 
 struct sleep_list_elem
 {
-	struct list_elem list_el;  
-	struct semaphore* sem;	
-	struct thread* current_thread; 
-	int64_t tick; 
+    struct list_elem list_el;
+    struct semaphore* sem;
+    struct thread* curr_thread;
+    int64_t tick;
 };
-
 
 void timer_init (void);
 void timer_calibrate (void);
