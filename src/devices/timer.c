@@ -30,43 +30,50 @@ static void busy_wait (int64_t loops);
 static void real_time_sleep (int64_t num, int32_t denom);
 static void real_time_delay (int64_t num, int32_t denom);
 
+struct list sleep_queue;
+struct lock sleep_queue_lock;
 
-struct list sleep_list;
-struct lock sleep_list_lock;
 /* Sets up the timer to interrupt TIMER_FREQ times per second,
    and registers the corresponding interrupt. */
 void
 timer_init (void) 
 {
-  list_init(&sleep_list);
-  lock_init(&sleep_list_lock);
+  list_init(&sleep_queue);
+  lock_init(&sleep_queue_lock);
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
+}
+
+static unsigned
+loop1_tick(void)
+{
+  unsigned loops = 1u << 10;
+  while (!too_many_loops (loops << 1)) 
+    {
+      loops <<= 1;
+      ASSERT (loops != 0);
+    }
+  return loops;
+}
+
+static void
+loop2_tick(unsigned *loops)
+{
+  unsigned high_bit = *loops;
+  for (unsigned test_bit = high_bit >> 1; test_bit != high_bit >> 10; test_bit >>= 1)
+    if (!too_many_loops (*loops | test_bit))
+      *loops |= test_bit;
 }
 
 /* Calibrates loops_per_tick, used to implement brief delays. */
 void
 timer_calibrate (void) 
 {
-  unsigned high_bit, test_bit;
-
   ASSERT (intr_get_level () == INTR_ON);
   printf ("Calibrating timer...  ");
 
-  /* Approximate loops_per_tick as the largest power-of-two
-     still less than one timer tick. */
-  loops_per_tick = 1u << 10;
-  while (!too_many_loops (loops_per_tick << 1)) 
-    {
-      loops_per_tick <<= 1;
-      ASSERT (loops_per_tick != 0);
-    }
-
-  /* Refine the next 8 bits of loops_per_tick. */
-  high_bit = loops_per_tick;
-  for (test_bit = high_bit >> 1; test_bit != high_bit >> 10; test_bit >>= 1)
-    if (!too_many_loops (loops_per_tick | test_bit))
-      loops_per_tick |= test_bit;
+  loops_per_tick = loop1_tick();
+  loop2_tick(&loops_per_tick);
 
   printf ("%'"PRIu64" loops/s.\n", (uint64_t) loops_per_tick * TIMER_FREQ);
 }
@@ -89,13 +96,39 @@ timer_elapsed (int64_t then)
   return timer_ticks () - then;
 }
 
-/*A function to compare sleeping threads in a list */
+/* Compare function for sleeping thread list */
 static bool
-compare_function(const struct list_elem *var_a, const struct list_elem *var_b, void * aux UNUSED)
+list_fnc(const struct list_elem *a, const struct list_elem *b, void * aux UNUSED)
 {
-  struct sleep_list_elem* first = list_entry(var_a, struct sleep_list_elem, list_el);
-  struct sleep_list_elem* second = list_entry(var_b, struct sleep_list_elem, list_el);
-  return first->tick < second->tick;
+  struct sleep_list_elem* thread1 = list_entry(a, struct sleep_list_elem, list_el);
+  struct sleep_list_elem* thread2 = list_entry(b, struct sleep_list_elem, list_el);
+  if (thread1->tick < thread2->tick)
+    {
+      return true;
+    }
+  else
+    {
+      return false;
+    }
+}
+
+static void
+thread_to_queue(int64_t ticks, int64_t start)
+{
+  struct thread* curr = thread_current();
+  struct semaphore sem;
+  sema_init(&sem, 0);
+  
+  struct sleep_list_elem curr_elem;
+  curr_elem.sem = &sem;
+  curr_elem.curr_thread = curr;
+  curr_elem.tick = ticks + start;
+  
+  lock_acquire(&sleep_queue_lock);
+  list_insert_ordered(&sleep_queue, &curr_elem.list_el, &list_fnc, NULL);
+  lock_release(&sleep_queue_lock);
+  
+  sema_down(&sem);
 }
 
 /* Sleeps for approximately TICKS timer ticks.  Interrupts must
@@ -103,23 +136,14 @@ compare_function(const struct list_elem *var_a, const struct list_elem *var_b, v
 void
 timer_sleep (int64_t ticks) 
 {
-  if(ticks <=0) {return;}
-    else
-  {
+  if (ticks <= 0)
+    {
+      return;
+    }
   int64_t start = timer_ticks ();
-  struct thread *current_thread=thread_current();
-  struct semaphore sem;
-  sema_init(&sem, 0);
-  struct sleep_list_elem current_element;
-  current_element.sem=&sem;
-  current_element.current_thread= current_thread;
-  current_element.tick = ticks + start;
 
-  lock_acquire(&sleep_list_lock);
-  list_insert_ordered(&sleep_list, &current_element.list_el, &compare_function , NULL);
-  lock_release(&sleep_list_lock);
-  sema_down(&sem);
-  }
+  ASSERT (intr_get_level () == INTR_ON);
+  thread_to_queue(ticks, start);
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -191,22 +215,31 @@ timer_print_stats (void)
 {
   printf ("Timer: %"PRId64" ticks\n", timer_ticks ());
 }
-
+
+static void
+wakeup_threads(void)
+{
+  for (; !list_empty(&sleep_queue);)
+    {
+      struct sleep_list_elem* curr = list_entry(list_begin(&sleep_queue), struct sleep_list_elem, list_el);
+      if (ticks >= curr->tick)
+        {
+          sema_up(curr->sem);
+          list_pop_front(&sleep_queue);
+        }
+      else
+        {
+          break;
+        }
+    }
+}
+
 /* Timer interrupt handler. */
 static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
-
-  while(!list_empty(&sleep_list)){
-    struct sleep_list_elem* current_thread = list_entry(list_begin(&sleep_list), struct sleep_list_elem, list_el);
-      if(ticks >= current_thread->tick){
-      sema_up(current_thread->sem);
-      list_pop_front(&sleep_list);
-      continue;
-    }
-    break;
-  }
+  wakeup_threads();
   thread_tick ();
 }
 
@@ -226,7 +259,14 @@ too_many_loops (unsigned loops)
 
   /* If the tick count changed, we iterated too long. */
   barrier ();
-  return start != ticks;
+  if (start != ticks)
+    {
+      return true;
+    }
+  else
+    {
+      return false;
+    }
 }
 
 /* Iterates through a simple loop LOOPS times, for implementing
